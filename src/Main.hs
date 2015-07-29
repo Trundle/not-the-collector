@@ -6,23 +6,25 @@ import           Control.Concurrent.Chan          (Chan, newChan, readChan)
 import           Control.Monad                    (forever, liftM)
 import           Control.Monad.IO.Class           (MonadIO, liftIO)
 import           Control.Monad.Trans.Class        (lift)
+import           Control.Monad.Trans.Resource     (runResourceT)
 import           Control.Monad.Trans.State.Strict (StateT, get, put)
-import           Data.Aeson                       (Value, toJSON)
+import           Data.Aeson                       (Value, toJSON, (.=))
 import qualified Data.ByteString                  as BS
-import qualified Data.ByteString.Char8            as BSC
-import           Data.Conduit                     (Conduit, Consumer, Producer,
+import           Data.Conduit                     (Conduit, Producer,
                                                    awaitForever, yield, ($$),
                                                    (=$=))
 import qualified Data.Conduit.Binary              as CB
 import qualified Data.Conduit.Lift                as CLift
 import           Data.Conduit.List                as CL
 import           Data.Text.Encoding               as TE
+import           Data.Time.Clock.POSIX            (getPOSIXTime)
 import           Options.Applicative              (Parser, ParserInfo, command,
                                                    execParser, help, helper,
                                                    idm, info, metavar, progDesc,
                                                    short, strOption, subparser,
                                                    (<$>), (<**>), (<>))
 import           Prelude                          hiding (FilePath)
+import           System.Directory                 (makeAbsolute)
 import           System.Exit                      (exitFailure)
 import           System.FilePath                  (FilePath, takeFileName)
 import           System.FSNotify                  (Event (..), eventPath,
@@ -30,6 +32,7 @@ import           System.FSNotify                  (Event (..), eventPath,
 import qualified System.IO                        as IO
 import           Text.Toml                        (parseTomlDoc)
 
+import qualified Graylog.Gelf                     as Gelf
 
 data Command = Run String
 
@@ -70,6 +73,17 @@ filterModifiedConfig _ = False
 chunkSize :: Int
 chunkSize = 16 * 1024
 
+
+toMessage :: MonadIO m => FilePath -> Conduit BS.ByteString m Gelf.Message
+toMessage path = awaitForever $ \msg -> do
+  timestamp <- liftIO getPOSIXTime
+  yield Gelf.Message { Gelf.message = TE.decodeUtf8 msg
+                     , Gelf.timestamp = timestamp
+                     , Gelf.source = "spam"
+                     , Gelf.additionalFields = ["_source_file" .= path]
+                     }
+
+
 main :: IO ()
 main = execParser opts >>= \cmd -> case cmd of
   Run configPath -> do
@@ -77,24 +91,26 @@ main = execParser opts >>= \cmd -> case cmd of
     chan <- newChan
     withManager $ \manager -> do
       _ <- watchDirChan manager "." filterModifiedConfig chan
-      chanProducer chan
+      runResourceT $ chanProducer chan
         $$  CL.map eventPath
-        =$= fileTail "config.sample"
-        =$= lineChunker
-        =$= printConsumer
+        =$= fileTail "config.sample" lineChunker
+        =$= Gelf.gelfUdpConsumer "127.0.0.1" 12201
     return ()
     where
-      printConsumer :: MonadIO m => Consumer BS.ByteString m ()
-      printConsumer = CL.mapM_ $ liftIO . BSC.putStr
-
-      fileTail :: MonadIO m => FilePath -> Conduit FilePath m BS.ByteString
-      fileTail path = do
-        (fileHandle, pos) <- liftIO $ do
+      fileTail :: MonadIO m =>
+                  FilePath ->
+                  Conduit BS.ByteString m BS.ByteString ->
+                  Conduit FilePath m Gelf.Message
+      fileTail path chunker = do
+        (absolutePath, fileHandle, pos) <- liftIO $ do
            fileHandle <- IO.openFile "config.sample" IO.ReadMode
+           absolutePath <- makeAbsolute path
            IO.hSeek fileHandle IO.SeekFromEnd 0
            pos <- IO.hTell fileHandle
-           return (fileHandle, pos)
+           return (absolutePath, fileHandle, pos)
         CLift.evalStateC pos (content fileHandle)
+          =$= chunker
+          =$= toMessage absolutePath
 
       content :: MonadIO m => IO.Handle -> Conduit FilePath (StateT Integer m) BS.ByteString
       content handle = awaitForever $ \path -> do

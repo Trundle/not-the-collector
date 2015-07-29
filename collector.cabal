@@ -18,11 +18,15 @@ executable collector
                      , bytestring
                      , conduit
                      , conduit-extra
+                     , directory >= 1.2.2.0
                      , filepath
                      , fsnotify >= 0.2
                      , htoml
                      , mtl
+                     , network
                      , optparse-applicative
+                     , resourcet
                      , text
+                     , time
                      , transformers
   default-language:    Haskell2010
