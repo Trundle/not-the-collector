@@ -18,6 +18,7 @@ executable collector
                      , bytestring
                      , conduit
                      , conduit-extra
+                     , containers
                      , directory >= 1.2.2.0
                      , filepath
                      , fsnotify >= 0.2
@@ -26,6 +27,8 @@ executable collector
                      , network
                      , optparse-applicative
                      , resourcet
+                     , stm
+                     , stm-conduit
                      , text
                      , time
                      , transformers

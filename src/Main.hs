@@ -2,20 +2,29 @@
 {-# LANGUAGE RankNTypes        #-}
 module Main where
 
+import           Control.Applicative              ((<*>))
+import           Control.Concurrent               (forkIO)
 import           Control.Concurrent.Chan          (Chan, newChan, readChan)
-import           Control.Monad                    (forever, liftM)
+import           Control.Monad                    (forM, forever, liftM, mzero)
 import           Control.Monad.IO.Class           (MonadIO, liftIO)
+import           Control.Monad.STM                (atomically)
 import           Control.Monad.Trans.Class        (lift)
-import           Control.Monad.Trans.Resource     (runResourceT)
+import           Control.Monad.Trans.Resource     (MonadResource, runResourceT)
 import           Control.Monad.Trans.State.Strict (StateT, get, put)
-import           Data.Aeson                       (Value, toJSON, (.=))
+import           Data.Aeson                       (Value, toJSON, (.:), (.=))
+import qualified Data.Aeson                       as A
+import qualified Data.Aeson.Types                 as AT
 import qualified Data.ByteString                  as BS
-import           Data.Conduit                     (Conduit, Producer,
+import           Data.Conduit                     (Conduit, Consumer, Producer,
                                                    awaitForever, yield, ($$),
                                                    (=$=))
 import qualified Data.Conduit.Binary              as CB
 import qualified Data.Conduit.Lift                as CLift
 import           Data.Conduit.List                as CL
+import           Data.Conduit.TMChan              (TBMChan, newTBMChan,
+                                                   sinkTBMChan, sourceTBMChan)
+import qualified Data.Map                         as M
+import           Data.Maybe                       (fromJust)
 import           Data.Text.Encoding               as TE
 import           Data.Time.Clock.POSIX            (getPOSIXTime)
 import           Options.Applicative              (Parser, ParserInfo, command,
@@ -36,14 +45,15 @@ import qualified Graylog.Gelf                     as Gelf
 
 data Command = Run String
 
-run :: Parser Command
-run = Run <$> strOption (  short 'f'
+runCommand :: Parser Command
+runCommand = Run <$> strOption (  short 'f'
                         <> metavar "CONFIG"
                         <> help "Path to configuration file."
                         )
 
 commands :: Parser Command
-commands = subparser $ command "run" (info run (progDesc "Start the collector"))
+commands = subparser $
+  command "run" (info runCommand (progDesc "Start the collector"))
 
 opts :: ParserInfo Command
 opts = info (commands <**> helper) idm
@@ -84,41 +94,87 @@ toMessage path = awaitForever $ \msg -> do
                      }
 
 
+data Output =
+  GelfUdp String Int
+  | Stdout deriving (Show)
+
+instance A.FromJSON Output where
+  parseJSON (A.Object v) = do
+    outputType <- v .: "type" :: AT.Parser String
+    case outputType of
+      "gelf-udp" -> GelfUdp <$> v .: "host"
+                            <*> v .: "port"
+      "stdout" -> return Stdout
+      _ -> fail $ "unknown output type: " ++ outputType
+  parseJSON _          = mzero
+
+
+parseOutputs :: A.Value -> Either String (M.Map String Output)
+parseOutputs (A.Object config) = flip AT.parseEither config $ \obj ->
+  obj .: "outputs"
+parseOutputs _ = error "expected an object"
+
+
+createOutput :: MonadResource m => Output -> Consumer Gelf.Message m ()
+createOutput (GelfUdp host port) = Gelf.gelfUdpConsumer host port
+createOutput (Stdout) = CL.mapM_ $ liftIO . print
+
+
+createAndRunOutputs :: Value -> IO (M.Map String (TBMChan Gelf.Message))
+createAndRunOutputs config = do
+  outputConfigs <- case parseOutputs config of
+    Left e -> do
+      putStrLn $ "Parsing of outputs failed: " ++ e
+      exitFailure
+    Right outputs -> return outputs
+  outputs <- forM (M.toList outputConfigs) $ \(name, outputConfig) -> do
+    chan <- atomically $ newTBMChan 512 -- XXX make size configurable
+    _ <- forkIO . runResourceT $ sourceTBMChan chan $$ createOutput outputConfig
+    return (name, chan)
+  return $ M.fromList outputs
+
+
+run :: FilePath -> IO ()
+run configPath = do
+  json <- parseConfig configPath
+  outputs <- createAndRunOutputs json
+
+  chan <- newChan
+  withManager $ \manager -> do
+    _ <- watchDirChan manager "." filterModifiedConfig chan
+    runResourceT $ chanProducer chan
+      $$  CL.map eventPath
+      =$= fileTail "config.sample" lineChunker
+      =$= sinkTBMChan (fromJust $ M.lookup "stdout" outputs) True
+  return ()
+  where
+    fileTail :: MonadIO m =>
+                FilePath ->
+                Conduit BS.ByteString m BS.ByteString ->
+                Conduit FilePath m Gelf.Message
+    fileTail path chunker = do
+      (absolutePath, fileHandle, pos) <- liftIO $ do
+         fileHandle <- IO.openFile "config.sample" IO.ReadMode
+         absolutePath <- makeAbsolute path
+         IO.hSeek fileHandle IO.SeekFromEnd 0
+         pos <- IO.hTell fileHandle
+         return (absolutePath, fileHandle, pos)
+      CLift.evalStateC pos (content fileHandle)
+        =$= chunker
+        =$= toMessage absolutePath
+
+    content :: MonadIO m => IO.Handle -> Conduit FilePath (StateT Integer m) BS.ByteString
+    content handle = awaitForever $ \path -> do
+      pos <- lift get
+      (nextPos, bytes) <- liftIO $ do
+        IO.hSeek handle IO.AbsoluteSeek pos
+        bytes <- BS.hGetNonBlocking handle chunkSize
+        nextPos <- IO.hTell handle
+        return (nextPos, bytes)
+      lift $ put nextPos
+      yield bytes
+
+
 main :: IO ()
 main = execParser opts >>= \cmd -> case cmd of
-  Run configPath -> do
-    json <- parseConfig configPath
-    chan <- newChan
-    withManager $ \manager -> do
-      _ <- watchDirChan manager "." filterModifiedConfig chan
-      runResourceT $ chanProducer chan
-        $$  CL.map eventPath
-        =$= fileTail "config.sample" lineChunker
-        =$= Gelf.gelfUdpConsumer "127.0.0.1" 12201
-    return ()
-    where
-      fileTail :: MonadIO m =>
-                  FilePath ->
-                  Conduit BS.ByteString m BS.ByteString ->
-                  Conduit FilePath m Gelf.Message
-      fileTail path chunker = do
-        (absolutePath, fileHandle, pos) <- liftIO $ do
-           fileHandle <- IO.openFile "config.sample" IO.ReadMode
-           absolutePath <- makeAbsolute path
-           IO.hSeek fileHandle IO.SeekFromEnd 0
-           pos <- IO.hTell fileHandle
-           return (absolutePath, fileHandle, pos)
-        CLift.evalStateC pos (content fileHandle)
-          =$= chunker
-          =$= toMessage absolutePath
-
-      content :: MonadIO m => IO.Handle -> Conduit FilePath (StateT Integer m) BS.ByteString
-      content handle = awaitForever $ \path -> do
-        pos <- lift get
-        (nextPos, bytes) <- liftIO $ do
-          IO.hSeek handle IO.AbsoluteSeek pos
-          bytes <- BS.hGetNonBlocking handle chunkSize
-          nextPos <- IO.hTell handle
-          return (nextPos, bytes)
-        lift $ put nextPos
-        yield bytes
+  Run configPath -> run configPath

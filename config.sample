@@ -1,1 +1,17 @@
 # Sample configuration file for collector
+#
+# collector uses the toml configuration format. See
+# https://github.com/toml-lang/toml for details.
+#
+
+[inputs]
+
+[outputs]
+  [outputs.gelf-udp]
+  type = "gelf-udp"
+  host = "127.0.0.1"
+  port = 12201
+  client-queue-size = 512
+
+  [outputs.stdout]
+  type = "stdout"
