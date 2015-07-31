@@ -10,7 +10,7 @@ import           Control.Monad.STM                (atomically)
 import           Control.Monad.Trans.Class        (lift)
 import           Control.Monad.Trans.Resource     (MonadResource, runResourceT)
 import           Control.Monad.Trans.State.Strict (StateT, get, put)
-import           Data.Aeson                       (Value, (.=))
+import           Data.Aeson                       ((.=))
 import qualified Data.ByteString                  as BS
 import           Data.Conduit                     (Conduit, Consumer, Producer,
                                                    Sink, ZipSink (..),
@@ -104,13 +104,9 @@ createOutput (GelfUdp host port) = Gelf.gelfUdpConsumer host port
 createOutput (Stdout) = CL.mapM_ $ liftIO . print
 
 
-createAndRunOutputs :: Value -> IO (M.Map String (TBMChan Gelf.Message))
-createAndRunOutputs config = do
-  outputConfigs <- case Config.parseOutputs config of
-    Left e -> do
-      putStrLn $ "Parsing of outputs failed: " ++ e
-      exitFailure
-    Right outputs -> return $ M.toList outputs
+createAndRunOutputs :: [(String, Output)] ->
+                       IO (M.Map String (TBMChan Gelf.Message))
+createAndRunOutputs outputConfigs = do
   when (null outputConfigs) $ do
     putStrLn "No outputs defined, nothing to do..."
     exitFailure
@@ -193,21 +189,17 @@ createAndRunChunkers hostName inputs outputs = do
   return $ M.fromList consumerChansByPath
 
 createAndRunInputs :: T.Text ->
-                      Value ->
+                      [Input] ->
                       M.Map String (TBMChan Gelf.Message) ->
                       IO ()
-createAndRunInputs hostName config runningOutputs = do
-  inputs <- case Config.parseInputs config of
-    Left e -> do
-      putStrLn $ "Parsing of inputs failed: " ++ e
-      exitFailure
-    Right inputs -> toAbsoluteFile inputs
+createAndRunInputs hostName inputs runningOutputs = do
   when (null inputs) $ do
     putStrLn "No inputs defined, nothing to do..."
     exitFailure
-  consumerChans <- createAndRunChunkers hostName inputs runningOutputs
+  absoluteInputs <- toAbsoluteFile inputs
+  consumerChans <- createAndRunChunkers hostName absoluteInputs runningOutputs
   let outputsByDirectory = (  L.groupBy ((==) `on` getDirectory)
-                            . L.sortBy byDirectory) inputs
+                            . L.sortBy byDirectory) absoluteInputs
   withManager $ \manager -> forM_ outputsByDirectory $ \outputs -> do
       let directory = getDirectory $ head outputs
       let paths = collectPaths outputs
@@ -224,10 +216,15 @@ createAndRunInputs hostName config runningOutputs = do
 
 run :: FilePath -> IO ()
 run configPath = do
-  json <- Config.parseConfig configPath
-  outputs <- createAndRunOutputs json
-  hostName <- getHostName
-  createAndRunInputs (T.pack hostName) json outputs
+  result <- Config.loadConfig configPath
+  case result of
+    Left e -> do
+      putStrLn e
+      exitFailure
+    Right (inputs, outputs) -> do
+      runningOutputs <- createAndRunOutputs outputs
+      hostName <- getHostName
+      createAndRunInputs (T.pack hostName) inputs runningOutputs
 
 
 main :: IO ()

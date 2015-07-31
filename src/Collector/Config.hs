@@ -1,20 +1,22 @@
+-- This module deliberately declares orphan instances:
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Collector.Config (
-    parseConfig
-  , parseInputs
-  , parseOutputs
+    loadConfig
+  , parseConfig
   ) where
 
 import           Control.Applicative ((<$>), (<*>))
-import           Control.Monad       (liftM, mzero)
+import           Control.Monad       (forM_, liftM, mzero)
 import           Data.Aeson          ((.:))
 import qualified Data.Aeson          as A
 import qualified Data.Aeson.Types    as AT
 import qualified Data.ByteString     as BS
+import           Data.List           (intercalate)
 import qualified Data.Map.Strict     as M
+import qualified Data.Text           as T
 import qualified Data.Text.Encoding  as TE
 import           Prelude             hiding (FilePath)
-import           System.Exit         (exitFailure)
 import           System.FilePath     (FilePath)
 import           Text.Toml           (parseTomlDoc)
 
@@ -42,12 +44,26 @@ instance A.FromJSON Output where
   parseJSON _ = mzero
 
 
-parseConfig :: FilePath -> IO A.Value
-parseConfig path = do
+
+parseConfig :: FilePath ->
+               T.Text ->
+               Either String ([Input], [(String, Output)])
+parseConfig path contents = do
+  toml <- case parseTomlDoc path contents of
+    Left e -> Left $ "Error while loading config: " ++ show e
+    Right t -> Right t
+  let json = A.toJSON toml
+  inputs <- parseInputs json
+  outputs <- parseOutputs json
+  checkConnections inputs outputs
+  return (M.elems inputs, M.toList outputs)
+
+
+loadConfig :: FilePath ->
+              IO (Either String ([Input], [(String, Output)]))
+loadConfig path = do
   configContents <- liftM TE.decodeUtf8 $ BS.readFile path
-  case parseTomlDoc path configContents of
-    Left e -> print e >>= const exitFailure
-    Right toml -> return $ A.toJSON toml
+  return $ parseConfig path configContents
 
 
 parseOutputs :: A.Value -> Either String (M.Map String Output)
@@ -56,8 +72,23 @@ parseOutputs (A.Object config) = flip AT.parseEither config $ \obj ->
 parseOutputs _ = error "expected an object"
 
 
-parseInputs :: A.Value -> Either String [Input]
-parseInputs (A.Object config) = flip AT.parseEither config $ \obj -> do
-   inputs <- obj .: "inputs" :: AT.Parser (M.Map String Input)
-   return $ M.elems inputs
+parseInputs :: A.Value -> Either String (M.Map String Input)
+parseInputs (A.Object config) = flip AT.parseEither config $ \obj ->
+   obj .: "inputs" :: AT.Parser (M.Map String Input)
 parseInputs _ = error "expected an object"
+
+
+-- |Verify that every referenced output exists.
+checkConnections :: M.Map String Input ->
+                    M.Map String Output ->
+                    Either String ()
+checkConnections inputs outputs =
+  forM_ (M.toList inputs) $ \(inputName, File _ inputOutputs) -> do
+    let missingOutputs = filter outputNotExists inputOutputs
+    if null missingOutputs then Right ()
+      else Left $ "The following outputs of input "
+           ++ inputName
+           ++ " do not exist: "
+           ++ intercalate ", " missingOutputs
+  where
+    outputNotExists = not . flip elem (M.keys outputs)
