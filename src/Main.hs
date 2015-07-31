@@ -1,19 +1,17 @@
+
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes        #-}
 module Main where
 
-import           Control.Applicative              ((<*>))
 import           Control.Concurrent               (forkIO)
 import           Control.Concurrent.Chan          (Chan, newChan, readChan)
-import           Control.Monad                    (forM, forever, liftM, mzero)
+import           Control.Monad                    (forM, forever)
 import           Control.Monad.IO.Class           (MonadIO, liftIO)
 import           Control.Monad.STM                (atomically)
 import           Control.Monad.Trans.Class        (lift)
 import           Control.Monad.Trans.Resource     (MonadResource, runResourceT)
 import           Control.Monad.Trans.State.Strict (StateT, get, put)
-import           Data.Aeson                       (Value, toJSON, (.:), (.=))
-import qualified Data.Aeson                       as A
-import qualified Data.Aeson.Types                 as AT
+import           Data.Aeson                       (Value, (.=))
 import qualified Data.ByteString                  as BS
 import           Data.Conduit                     (Conduit, Consumer, Producer,
                                                    awaitForever, yield, ($$),
@@ -39,8 +37,9 @@ import           System.FilePath                  (FilePath, takeFileName)
 import           System.FSNotify                  (Event (..), eventPath,
                                                    watchDirChan, withManager)
 import qualified System.IO                        as IO
-import           Text.Toml                        (parseTomlDoc)
 
+import           Collector.Config                 (parseConfig, parseOutputs)
+import           Collector.Types                  (Output (..))
 import qualified Graylog.Gelf                     as Gelf
 
 data Command = Run String
@@ -58,13 +57,6 @@ commands = subparser $
 opts :: ParserInfo Command
 opts = info (commands <**> helper) idm
 
-
-parseConfig :: FilePath -> IO Value
-parseConfig path = do
-  configContents <- liftM TE.decodeUtf8 $ BS.readFile path
-  case parseTomlDoc path configContents of
-    Left e -> print e >>= const exitFailure
-    Right toml -> return $ toJSON toml
 
 
 chanProducer :: MonadIO m => Chan a -> Producer m a
@@ -92,27 +84,6 @@ toMessage path = awaitForever $ \msg -> do
                      , Gelf.source = "spam"
                      , Gelf.additionalFields = ["_source_file" .= path]
                      }
-
-
-data Output =
-  GelfUdp String Int
-  | Stdout deriving (Show)
-
-instance A.FromJSON Output where
-  parseJSON (A.Object v) = do
-    outputType <- v .: "type" :: AT.Parser String
-    case outputType of
-      "gelf-udp" -> GelfUdp <$> v .: "host"
-                            <*> v .: "port"
-      "stdout" -> return Stdout
-      _ -> fail $ "unknown output type: " ++ outputType
-  parseJSON _          = mzero
-
-
-parseOutputs :: A.Value -> Either String (M.Map String Output)
-parseOutputs (A.Object config) = flip AT.parseEither config $ \obj ->
-  obj .: "outputs"
-parseOutputs _ = error "expected an object"
 
 
 createOutput :: MonadResource m => Output -> Consumer Gelf.Message m ()
