@@ -1,6 +1,14 @@
 module Collector.Types (
-  Output (..)
+    Input (..)
+  , Output (..)
   ) where
+
+import           Prelude         hiding (FilePath)
+import           System.FilePath (FilePath)
+
+
+data Input = File FilePath [String]
+           deriving (Show)
 
 
 data Output =

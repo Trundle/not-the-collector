@@ -5,6 +5,10 @@
 #
 
 [inputs]
+ [inputs.config-sample]
+ type = "file"
+ path = "config.sample"
+ outputs = ["stdout", "gelf-udp"]
 
 [outputs]
   [outputs.gelf-udp]
