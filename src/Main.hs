@@ -64,7 +64,7 @@ chanProducer chan = forever $ yield =<< liftIO (readChan chan)
 
 
 lineChunker :: Monad m => Conduit BS.ByteString m BS.ByteString
-lineChunker = CB.lines
+lineChunker = CB.lines =$= CL.filter (not . BS.null)
 
 
 filterModifiedConfig :: Event -> Bool
