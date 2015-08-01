@@ -3,7 +3,6 @@ packages:
 - '.'
 extra-deps:
 - 'directory-1.2.3.0'
-- 'fsnotify-0.2.0.2'
 - 'htoml-0.1.0.2'
 - 'tasty-hspec-1.1'
 resolver: lts-2.20

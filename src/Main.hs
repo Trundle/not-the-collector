@@ -3,7 +3,8 @@
 module Main where
 
 import           Control.Concurrent               (forkIO, threadDelay)
-import           Control.Monad                    (forM, forM_, forever, when)
+import           Control.Monad                    (forM, forM_, forever, liftM,
+                                                   when)
 import           Control.Monad.IO.Class           (MonadIO, liftIO)
 import           Control.Monad.STM                (atomically)
 import           Control.Monad.Trans.Class        (lift)
@@ -38,9 +39,11 @@ import           Options.Applicative              (Parser, ParserInfo, command,
 import           Prelude                          hiding (FilePath)
 import           System.Directory                 (makeAbsolute)
 import           System.Exit                      (exitFailure)
-import           System.FilePath                  (FilePath, takeDirectory)
-import           System.FSNotify                  (Event (..), eventPath,
-                                                   watchDir, withManager)
+import           System.FilePath                  (FilePath, combine,
+                                                   takeDirectory)
+import           System.INotify                   (Event (..),
+                                                   EventVariety (..), addWatch,
+                                                   initINotify)
 import qualified System.IO                        as IO
 
 import qualified Collector.Config                 as Config
@@ -68,11 +71,6 @@ type Chunker = Monad m => Conduit BS.ByteString m BS.ByteString
 
 lineChunker :: Chunker
 lineChunker = CB.lines =$= CL.filter (not . BS.null)
-
-
-filterModifiedPaths :: [FilePath] -> Event -> Bool
-filterModifiedPaths paths (Modified path _) = path `L.elem` paths
-filterModifiedPaths _ _ = False
 
 
 chunkSize :: Int
@@ -186,18 +184,23 @@ createAndRunInputs hostName inputs runningOutputs = do
   consumerChans <- createAndRunFileInputs hostName absoluteInputs runningOutputs
   let outputsByDirectory = (  L.groupBy ((==) `on` getDirectory)
                             . L.sortBy byDirectory) absoluteInputs
-  withManager $ \manager -> forM_ outputsByDirectory $ \outputs -> do
+  inotify <- initINotify
+  forM_ outputsByDirectory $ \outputs -> do
       let directory = getDirectory $ head outputs
-      let paths = collectPaths outputs
-      _ <- watchDir manager directory (const True) (eventHandler consumerChans)
+      _ <- addWatch inotify [Modify] directory (eventHandler directory consumerChans)
       forever $ threadDelay maxBound
   where
     getDirectory (File path _) = takeDirectory path
     byDirectory = comparing getDirectory
-    eventHandler consumerChans event = do
-      print event
-      case M.lookup (eventPath event) consumerChans of
-        Just chan -> atomically $ writeTBMChan chan event
+
+    eventPath (Modified _ path) = path
+    eventPath _ = Nothing
+
+    eventHandler directory consumerChans event =
+      case liftM (combine directory) (eventPath event) of
+        Just path -> case M.lookup path consumerChans of
+          Just chan -> atomically $ writeTBMChan chan event
+          Nothing -> return ()
         Nothing -> return ()
 
 

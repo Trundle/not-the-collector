@@ -21,7 +21,7 @@ executable collector
                      , containers
                      , directory >= 1.2.2.0
                      , filepath
-                     , fsnotify >= 0.2
+                     , hinotify
                      , htoml
                      , mtl
                      , network
