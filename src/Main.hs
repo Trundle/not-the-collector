@@ -3,7 +3,6 @@
 module Main where
 
 import           Control.Concurrent               (forkIO, threadDelay)
-import           Control.Concurrent.Chan          (Chan, newChan, readChan)
 import           Control.Monad                    (forM, forM_, forever, when)
 import           Control.Monad.IO.Class           (MonadIO, liftIO)
 import           Control.Monad.STM                (atomically)
@@ -12,10 +11,9 @@ import           Control.Monad.Trans.Resource     (MonadResource, runResourceT)
 import           Control.Monad.Trans.State.Strict (StateT, get, put)
 import           Data.Aeson                       ((.=))
 import qualified Data.ByteString                  as BS
-import           Data.Conduit                     (Conduit, Consumer, Producer,
-                                                   Sink, ZipSink (..),
-                                                   awaitForever, yield, ($$),
-                                                   (=$=))
+import           Data.Conduit                     (Conduit, Consumer, Sink,
+                                                   ZipSink (..), awaitForever,
+                                                   yield, ($$), (=$=))
 import qualified Data.Conduit.Binary              as CB
 import qualified Data.Conduit.Lift                as CLift
 import qualified Data.Conduit.List                as CL
@@ -42,7 +40,7 @@ import           System.Directory                 (makeAbsolute)
 import           System.Exit                      (exitFailure)
 import           System.FilePath                  (FilePath, takeDirectory)
 import           System.FSNotify                  (Event (..), eventPath,
-                                                   watchDirChan, withManager)
+                                                   watchDir, withManager)
 import qualified System.IO                        as IO
 
 import qualified Collector.Config                 as Config
@@ -63,11 +61,6 @@ commands = subparser $
 
 opts :: ParserInfo Command
 opts = info (commands <**> helper) idm
-
-
-
-chanProducer :: MonadIO m => Chan a -> Producer m a
-chanProducer chan = forever $ yield =<< liftIO (readChan chan)
 
 
 type Chunker = Monad m => Conduit BS.ByteString m BS.ByteString
@@ -129,38 +122,30 @@ collectPaths :: [Input] -> [FilePath]
 collectPaths = map (\(File path _) -> path)
 
 
-filesTail :: MonadIO m =>
-             [FilePath] ->
-             M.Map FilePath (TBMChan BS.ByteString) ->
-             Consumer FilePath m ()
-filesTail paths consumerChans = do
-  handlesAndPositionsByPath <- liftIO $ forM paths $ \path -> do
+fileTail :: MonadIO m =>
+            FilePath ->
+            Conduit Event m BS.ByteString
+fileTail path = do
+  (handle, position) <- liftIO $ do
     handle <- IO.openFile path IO.ReadMode
     IO.hSeek handle IO.SeekFromEnd 0
     pos <- IO.hTell handle
-    return (path, (handle, pos))
-  CLift.evalStateC
-    (M.fromList handlesAndPositionsByPath)
-    (contentsReader consumerChans)
+    return (handle, pos)
+  CLift.evalStateC position (contentsReader handle)
 
 
 contentsReader :: MonadIO m =>
-                  M.Map FilePath (TBMChan BS.ByteString) ->
-                  Consumer FilePath (StateT (M.Map String (IO.Handle, Integer)) m) ()
-contentsReader consumerChans = awaitForever $ \path -> do
-  handlesAndPositionsByPath <- lift get
-  case M.lookup path handlesAndPositionsByPath of
-    Nothing -> return ()
-    Just (handle, pos) -> do
-      (newPos, bytes) <- liftIO $ do
-        IO.hSeek handle IO.AbsoluteSeek pos
-        bytes <- BS.hGetNonBlocking handle chunkSize
-        newPos <- IO.hTell handle
-        return (newPos, bytes)
-      lift $ put $ M.insert path (handle, newPos) handlesAndPositionsByPath
-      case M.lookup path consumerChans of
-        Just chan -> liftIO . atomically $ writeTBMChan chan bytes
-        Nothing -> return ()
+                  IO.Handle ->
+                  Conduit Event (StateT Integer m) BS.ByteString
+contentsReader handle = awaitForever $ \_ -> do
+  pos <- lift get
+  (newPos, bytes) <- liftIO $ do
+    IO.hSeek handle IO.AbsoluteSeek pos
+    bytes <- BS.hGetNonBlocking handle chunkSize
+    newPos <- IO.hTell handle
+    return (newPos, bytes)
+  lift $ put newPos
+  yield bytes
 
 
 getOutputConsumer :: MonadIO m =>
@@ -174,15 +159,16 @@ getOutputConsumer outputs inputOutputs = (getZipSink . sequenceA_ . fmap ZipSink
     sinks = map getOutputSink inputOutputs
 
 
-createAndRunChunkers :: T.Text ->
-                        [Input] ->
-                        M.Map String (TBMChan Gelf.Message) ->
-                        IO (M.Map FilePath (TBMChan BS.ByteString))
-createAndRunChunkers hostName inputs outputs = do
+createAndRunFileInputs :: T.Text ->
+                          [Input] ->
+                          M.Map String (TBMChan Gelf.Message) ->
+                          IO (M.Map FilePath (TBMChan Event))
+createAndRunFileInputs hostName inputs outputs = do
   consumerChansByPath <- forM inputs $ \(File path inputOutputs) -> do
     chan <- atomically $ newTBMChan 16
     _ <- forkIO . runResourceT $ sourceTBMChan chan
-                               $$ lineChunker
+                               $$  fileTail path
+                               =$= lineChunker
                                =$= toMessage hostName path
                                =$= getOutputConsumer outputs inputOutputs
     return (path, chan)
@@ -197,21 +183,22 @@ createAndRunInputs hostName inputs runningOutputs = do
     putStrLn "No inputs defined, nothing to do..."
     exitFailure
   absoluteInputs <- toAbsoluteFile inputs
-  consumerChans <- createAndRunChunkers hostName absoluteInputs runningOutputs
+  consumerChans <- createAndRunFileInputs hostName absoluteInputs runningOutputs
   let outputsByDirectory = (  L.groupBy ((==) `on` getDirectory)
                             . L.sortBy byDirectory) absoluteInputs
   withManager $ \manager -> forM_ outputsByDirectory $ \outputs -> do
       let directory = getDirectory $ head outputs
       let paths = collectPaths outputs
-      chan <- liftIO newChan
-      _ <- watchDirChan manager directory (filterModifiedPaths paths) chan
-      _ <- forkIO $ runResourceT $ chanProducer chan
-           $$  CL.map eventPath
-           =$= filesTail paths consumerChans
+      _ <- watchDir manager directory (const True) (eventHandler consumerChans)
       forever $ threadDelay maxBound
   where
     getDirectory (File path _) = takeDirectory path
     byDirectory = comparing getDirectory
+    eventHandler consumerChans event = do
+      print event
+      case M.lookup (eventPath event) consumerChans of
+        Just chan -> atomically $ writeTBMChan chan event
+        Nothing -> return ()
 
 
 run :: FilePath -> IO ()
